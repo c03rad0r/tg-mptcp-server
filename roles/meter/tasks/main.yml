@@ -1,0 +1,226 @@
+---
+# roles/meter/tasks/main.yml
+#
+# WP1 — the metering ceiling and the booby-trap guard.
+#
+# This role establishes the CEILING and NOTHING ELSE: our own nftables table, rendered
+# default-deny, with the shape that makes over-quota traffic block rather than pass. It
+# creates no budget, runs no daemon and bills nobody. A later work package (WP4) supplies
+# the per-client budget; this role's job is that when that happens the failure direction is
+# already "customer gets nothing" (loud, reported) rather than "customer gets everything
+# free" (silent).
+#
+# Two measured facts drive the shape, and both are silent when wrong:
+#
+#  1. A metered chain in `policy accept` is a FREE TUNNEL. The quota expression signals
+#     over-quota by restoring the continue verdict and falling through to the NEXT RULE
+#     (nf_tables_core.c), so `quota ... accept` in an accept-policy chain delivers the
+#     over-quota packets and looks perfectly healthy. Measured: 81 of 100 over-quota
+#     packets delivered. Hence every metered chain here is `policy drop` with an explicit
+#     terminal `drop` and an allow-list ahead of it.
+#
+#  2. The proxy is NOT a netfilter forwarder. It terminates and opens its own sockets
+#     behind POSTROUTING MASQUERADE, so the client leg is counted in LOCAL_IN/LOCAL_OUT and
+#     a `forward` rule sees nothing of it. A "simplified" forward/egress rule silently
+#     switches the meter to internet-side bytes, and the customer then pays for the
+#     server's own retransmissions. Hence the metered rules are keyed on the client address
+#     and the proxy port, and the guard below FAILS the play if a metered rule ever names an
+#     egress interface.
+#
+# Everything that can vary lives in group_vars (see meter_* in group_vars/all.yml). No
+# threshold is hardcoded here.
+
+- name: Meter | Assert the meter is configured coherently
+  ansible.builtin.assert:
+    that:
+      - meter_table | length > 0
+      - meter_proxy_port | int > 0
+      - meter_payment_port | int > 0
+      - meter_family in ['ip', 'inet']
+      - meter_default_verdict == 'drop'
+    fail_msg: >-
+      Meter configuration is incoherent: table={{ meter_table }} proxy_port={{ meter_proxy_port }}
+      payment_port={{ meter_payment_port }} family={{ meter_family }}
+      default_verdict={{ meter_default_verdict }}. A metered chain MUST be default-deny
+      (meter_default_verdict=drop) and the ports MUST be set.
+
+- name: Meter | Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    state: present
+    update_cache: true
+    cache_valid_time: 3600
+
+- name: Meter | Assert nft is present after install
+  ansible.builtin.command:
+    cmd: nft --version
+  register: meter_nft_version
+  changed_when: false
+
+- name: Meter | Record the nft build we are rendering for
+  ansible.builtin.debug:
+    msg: "Meter | nft version: {{ meter_nft_version.stdout }}"
+
+# --- The table, rendered from ONE template so a run is atomic from the datapath's view ---
+#
+# Rendered as a single file and applied with one `nft -f`, so there is no window in which the
+# metered chain exists with a permissive policy.
+- name: Meter | Create the meter definitions directory
+  ansible.builtin.file:
+    path: "{{ meter_state_dir }}"
+    state: directory
+    mode: '0755'
+
+- name: Meter | Render the atomic swap file
+  ansible.builtin.template:
+    src: tg-meter-swap.nft.j2
+    dest: "{{ meter_state_dir }}/tg-meter-swap.nft"
+    mode: '0644'
+  register: meter_rendered
+
+# The swap is a delete-then-recreate, so it cannot report `changed` by diffing a file. It reports
+# changed only when the table it would install actually DIFFERS from the live one: the swap always
+# runs (it is cheap and it is what keeps duplicates impossible), but the reported state is honest.
+- name: Meter | Read the live table state before applying
+  ansible.builtin.command:
+    cmd: "nft list table {{ meter_family }} {{ meter_table }}"
+  changed_when: false
+  failed_when: false
+  register: meter_live_before
+
+- name: Meter | Apply the meter table atomically
+  ansible.builtin.command:
+    cmd: "nft -f {{ meter_state_dir }}/tg-meter-swap.nft"
+  changed_when: >-
+    meter_live_before.rc != 0 or
+    meter_rendered.changed or
+    (meter_live_before.stdout | regex_findall('accept') | length) != meter_expected_uplink_accepts | int + meter_expected_downlink_accepts | int
+  register: meter_apply
+
+# --- Persist the table across reboot (counters do NOT survive; the shape must) ---
+- name: Meter | Install the meter table unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/tg-meter-table.service
+    mode: '0644'
+    content: |
+      [Unit]
+      Description=Restore the TollGate meter table (shape only; counters are not persisted)
+      After=network.target
+      Before=nftables.service
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/sbin/nft -f {{ meter_state_dir }}/tg-meter-swap.nft
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+  notify: reload systemd
+
+- name: Meter | Enable the meter table unit
+  ansible.builtin.systemd:
+    name: tg-meter-table
+    enabled: true
+    state: started
+    daemon_reload: true
+
+# --- READ BACK FROM THE NODE. Never trust the apply's own exit code. ---
+- name: Meter | Read the uplink chain back from the node
+  ansible.builtin.command:
+    cmd: "nft list chain {{ meter_family }} {{ meter_table }} {{ meter_uplink_chain }}"
+  changed_when: false
+  register: meter_uplink_readback
+
+- name: Meter | Read the downlink chain back from the node
+  ansible.builtin.command:
+    cmd: "nft list chain {{ meter_family }} {{ meter_table }} {{ meter_downlink_chain }}"
+  changed_when: false
+  register: meter_downlink_readback
+
+# --- THE BOOBY-TRAP GUARD ---
+#
+# These asserts are the whole reason this work package exists. Each one closes a failure that
+# is invisible in a passing test: the table can be present, the service "active", every other
+# check green, and the meter still bill nothing or bill the wrong side.
+- name: Meter | Guard - both metered chains must be default-deny
+  ansible.builtin.assert:
+    that:
+      - "'policy drop' in meter_uplink_readback.stdout"
+      - "'policy drop' in meter_downlink_readback.stdout"
+    fail_msg: >-
+      A metered chain is NOT default-deny. An accept-policy metered chain delivers over-quota
+      traffic and is a free tunnel, while looking healthy. Uplink: {{ meter_uplink_readback.stdout }}
+      Downlink: {{ meter_downlink_readback.stdout }}
+
+- name: Meter | Guard - the metered rules must carry an explicit terminal drop
+  ansible.builtin.assert:
+    that:
+      - meter_uplink_readback.stdout is search('quota[^\n]*drop')
+      - meter_downlink_readback.stdout is search('quota[^\n]*drop')
+    fail_msg: >-
+      A metered rule does not terminate in an explicit drop. Relying on chain policy alone is
+      not sufficient: the quota expression falls through to the next rule when over budget.
+  # Only meaningful once at least one client is provisioned. With an empty client list the
+  # ceiling is default-deny and there is no metered rule to check — asserting here would fail
+  # a correctly-empty WP1 for the right reason at the wrong time.
+  when: meter_client_objects | length > 0
+
+- name: Meter | Report when no per-client objects are provisioned yet
+  ansible.builtin.debug:
+    msg: >-
+      No per-client objects are provisioned (meter_client_objects is empty), so the terminal-drop
+      guard is skipped. The ceiling is still default-deny, so nothing is forwarded. This is the
+      WP1 state: per-client counters, quotas and their metered rules arrive in WP4.
+  when: meter_client_objects | length == 0
+
+- name: Meter | Guard - the metered chains must not accumulate duplicate rules
+  ansible.builtin.assert:
+    that:
+      - meter_uplink_readback.stdout | regex_findall('accept') | length == meter_expected_uplink_accepts | int
+      - meter_downlink_readback.stdout | regex_findall('accept') | length == meter_expected_downlink_accepts | int
+    fail_msg: >-
+      The meter table has accumulated duplicate rules. `nft -f` on an existing table APPENDS
+      rather than replaces, so a repeated apply silently multiplies every rule while the playbook
+      still reports changed=0 and every other guard still passes (they check for presence, not for
+      absence of duplicates). Measured once: 24 accept rules where 4 belong.
+      uplink accept count = {{ meter_uplink_readback.stdout | regex_findall('accept') | length }}
+      (expected {{ meter_expected_uplink_accepts }})
+      downlink accept count = {{ meter_downlink_readback.stdout | regex_findall('accept') | length }}
+      (expected {{ meter_expected_downlink_accepts }})
+      The fix is the atomic delete-then-recreate in tg-meter-swap.nft.j2, not a flush.
+
+- name: Meter | Guard - a metered rule must never name an egress interface
+  ansible.builtin.assert:
+    that:
+      - "'oifname' not in meter_uplink_readback.stdout"
+      - "'oifname' not in meter_downlink_readback.stdout"
+    fail_msg: >-
+      A metered rule names an egress interface (oifname). That is the booby trap: it meters the
+      server's INTERNET side, so the customer pays for the server's own retransmissions. The
+      meter must stay on the client leg (client address + proxy port). See D3 in
+      docs/architecture/multi-wan-bonding-decision.md
+
+- name: Meter | Guard - the metered rules must key on the proxy port
+  ansible.builtin.assert:
+    that:
+      - "meter_proxy_port | string in meter_uplink_readback.stdout"
+      - "meter_proxy_port | string in meter_downlink_readback.stdout"
+    fail_msg: >-
+      The metered rules do not key on the proxy port ({{ meter_proxy_port }}). Without it the
+      meter cannot distinguish the client's proxied stream from unrelated traffic.
+  # Same condition as the terminal-drop guard: with no clients provisioned there are no metered
+  # rules, so there is no key to check. Asserting on an empty meter would fail WP1 correctly-empty.
+  when: meter_client_objects | length > 0
+
+- name: Meter | Summary
+  ansible.builtin.debug:
+    msg: |
+      Meter ceiling installed and read back from the node.
+        table:            {{ meter_family }} {{ meter_table }}
+        chains:           {{ meter_uplink_chain }} (input), {{ meter_downlink_chain }} (output)
+        proxy port:       {{ meter_proxy_port }}
+        payment port:     {{ meter_payment_port }} (must stay reachable while gated)
+        default verdict:  {{ meter_default_verdict }}
+        guards passed:    default-deny, terminal drop, no egress interface, proxy port keyed
+
+      NO BUDGET IS INSTALLED AND NOTHING IS BILLED by this role. Per-client objects arrive in WP4.

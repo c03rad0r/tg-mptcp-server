@@ -1,0 +1,60 @@
+#
+# tg-meter-swap.nft.j2 — atomically REPLACE the meter table.
+#
+# Why this file exists rather than simply applying tg-meter.nft.j2: `nft -f` on an
+# already-existing table APPENDS rules instead of replacing them. Applying the table template
+# twice therefore produces two copies of every rule, three times produces three, and the
+# playbook reports `changed: 0` throughout while every shape guard still passes — because the
+# guards check for PRESENCE of the right rules, not the ABSENCE of duplicates. Measured on the
+# acceptance target: three applies produced 24 accept rules per chain where 4 belong.
+#
+# The fix is delete-then-recreate inside ONE transaction, so the datapath never observes a
+# window in which the ceiling is missing:
+#
+#   1. delete the table (harmless if absent — this is the first run);
+#   2. recreate it, complete.
+#
+# Both statements are in this one file, applied with a single `nft -f`, so the kernel applies
+# them as one transaction. Verified repeatable on the target: `policy drop` count stays 1 across
+# consecutive runs, which is the proof it REPLACES rather than appends.
+#
+# `rename table` is NOT available — tested on the target, nft rejects it ("unexpected table,
+# expecting chain"); only chains and sets can be renamed. Do not reintroduce it.
+#
+# SCOPE: this touches ONLY {{ meter_table }}. It never runs `nft flush ruleset` and never names
+# another table — the host carries production tables (ip filter, inet fips-exit, inet f2b-table,
+# nat tables) that must not be disturbed.
+
+delete table {{ meter_family }} {{ meter_table }}
+
+table {{ meter_family }} {{ meter_table }} {
+  chain {{ meter_uplink_chain }} {
+    type filter hook input priority filter; policy {{ meter_default_verdict }};
+{% if meter_resolvers | length > 0 %}
+    ip saddr {{ meter_client_cidr }} udp dport 53 accept
+    ip saddr {{ meter_client_cidr }} tcp dport 53 accept
+{% endif %}
+    ip saddr {{ meter_client_cidr }} tcp dport {{ meter_payment_port }} accept
+    ip saddr {{ meter_client_cidr }} udp dport {{ meter_payment_port }} accept
+{% for client in meter_client_objects %}
+    ip saddr {{ client.cip }} tcp dport {{ meter_proxy_port }} \
+      counter name "{{ meter_counter_prefix }}_u_{{ client.cid }}" \
+      quota name "{{ meter_quota_prefix }}_{{ client.cid }}" drop
+{% endfor %}
+  }
+
+  chain {{ meter_downlink_chain }} {
+    type filter hook output priority filter; policy {{ meter_default_verdict }};
+{% if meter_resolvers | length > 0 %}
+    ip daddr {{ meter_client_cidr }} udp sport 53 accept
+    ip daddr {{ meter_client_cidr }} tcp sport 53 accept
+{% endif %}
+    ip daddr {{ meter_client_cidr }} tcp sport {{ meter_payment_port }} accept
+    ip daddr {{ meter_client_cidr }} udp sport {{ meter_payment_port }} accept
+{% for client in meter_client_objects %}
+    ip daddr {{ client.cip }} tcp sport {{ meter_proxy_port }} \
+      counter name "{{ meter_counter_prefix }}_d_{{ client.cid }}" \
+      quota name "{{ meter_quota_prefix }}_{{ client.cid }}" drop
+{% endfor %}
+  }
+}
