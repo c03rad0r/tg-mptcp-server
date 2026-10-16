@@ -14,5 +14,9 @@
     - role: mptcp_server
       tags: [setup, mptcp]
 
+    - role: meter
+      tags: [setup, meter]
+      when: meter_enabled | default(true) | bool
+
     - role: health
       tags: [setup, health, verify]

@@ -115,3 +115,59 @@
         Firewall: {{ ('ACTIVE' if 'active' in ufw_status.stdout else 'INACTIVE') if firewall_manage | default(false) | bool else 'NOT MANAGED (firewall_manage=false)' }}
 
       Server is ready to accept MPTCP connections from TollGate routers.
+
+# --- TollGate Meter shape (roles/meter, WP1) ---
+#
+# These asserts duplicate the guard in roles/meter deliberately: `--tags verify` must be able to
+# detect a meter that has been broken by hand after the fact. They read the live ruleset FROM THE
+# NODE, never the role's own report.
+- name: Meter | Read the uplink chain for the shape check
+  ansible.builtin.command:
+    cmd: "nft list chain {{ meter_family }} {{ meter_table }} {{ meter_uplink_chain }}"
+  changed_when: false
+  failed_when: false
+  register: hs_meter_uplink
+  when: meter_enabled | default(true) | bool
+
+- name: Meter | Read the downlink chain for the shape check
+  ansible.builtin.command:
+    cmd: "nft list chain {{ meter_family }} {{ meter_table }} {{ meter_downlink_chain }}"
+  changed_when: false
+  failed_when: false
+  register: hs_meter_downlink
+  when: meter_enabled | default(true) | bool
+
+- name: Meter | Assert the meter table exists at all
+  ansible.builtin.assert:
+    that:
+      - hs_meter_uplink.rc == 0
+      - hs_meter_downlink.rc == 0
+    fail_msg: >-
+      The meter table is missing. Expected {{ meter_family }} {{ meter_table }} with chains
+      {{ meter_uplink_chain }}/{{ meter_downlink_chain }}. Run: ansible-playbook --tags meter
+  when: meter_enabled | default(true) | bool
+
+- name: Meter | Assert the metered chains are default-deny and cannot meter the internet side
+  ansible.builtin.assert:
+    that:
+      - "'policy drop' in hs_meter_uplink.stdout"
+      - "'policy drop' in hs_meter_downlink.stdout"
+      - "'oifname' not in hs_meter_uplink.stdout"
+      - "'oifname' not in hs_meter_downlink.stdout"
+    fail_msg: >-
+      Meter shape is unsafe. Both metered chains must be `policy drop` (an accept-policy metered
+      chain delivers over-quota traffic and looks healthy), and no metered rule may name an
+      egress interface (that meters the server's internet side and charges the customer for the
+      server's own retransmissions).
+      Uplink: {{ hs_meter_uplink.stdout }}
+      Downlink: {{ hs_meter_downlink.stdout }}
+  when: meter_enabled | default(true) | bool
+
+- name: Meter | Report the shape verdict
+  ansible.builtin.debug:
+    msg: >-
+      Meter shape OK: default-deny on both chains, no egress interface in a metered rule.
+      NO BUDGET IS INSTALLED AND NOTHING IS BILLED until the per-client objects and the
+      journaling daemon arrive (WP4); until crash durability is proven, the system is
+      ADVISORY-ONLY.
+  when: meter_enabled | default(true) | bool
