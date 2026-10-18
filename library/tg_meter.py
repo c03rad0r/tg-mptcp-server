@@ -302,10 +302,15 @@ def verify(expect_shape: bool = True) -> list[str]:
         if ch is None:
             problems.append(f"chain {name} missing")
             continue
-        if ch.get("policy") != "drop":
+        # The chain policy MUST be `accept`, with the drop INSIDE the metered rule. A `policy drop`
+        # chain hooked at `input` drops every co-located service it is not told to accept -- that is
+        # not a theoretical hazard, it took down a host's ss-server and SSH during this programme's
+        # own deployment. The free-tunnel hazard is a DIFFERENT failure and is caught by the
+        # ordering check below (an accept rule ahead of the quota rule), not by the policy.
+        if ch.get("policy") != "accept":
             problems.append(
-                f"chain {name} policy is {ch.get('policy')!r}, must be 'drop' "
-                "(an accept-policy metered chain is a FREE TUNNEL)"
+                f"chain {name} policy is {ch.get('policy')!r}, must be 'accept' "
+                "(a drop-policy chain at this hook kills co-located services it does not name)"
             )
     # order + egress checks, on the rendered text (order is not visible in JSON by rule alone)
     for name in (UPLINK, DOWNLINK):
@@ -315,6 +320,11 @@ def verify(expect_shape: bool = True) -> list[str]:
         accept_idx = next(
             (i for i, ln in enumerate(lines) if "accept" in ln and "quota" not in ln), None
         )
+        if quota_idx is None and any("accept" in ln for ln in lines):
+            problems.append(
+                f"chain {name}: no quota rule found on the metered path -- "
+                "an accept-only chain is a FREE TUNNEL"
+            )
         if quota_idx is not None and accept_idx is not None and accept_idx < quota_idx:
             problems.append(
                 f"chain {name}: the accept rule precedes the quota/drop rule -- "
