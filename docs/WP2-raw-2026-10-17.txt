@@ -1,0 +1,79 @@
+=== WP2 target primitive matrix ===
+host:      testserver2
+kernel:    6.12.111+deb13-amd64
+nftables:  nftables v1.1.3 (Commodore Bullmoose #4)
+started:   2026-10-16T23:54:48+00:00
+safety:    touches only tables matching __wp2_*, takes /tmp/tg-meter.lock
+
+--- A. table / chain / counter basics ---
+PASS  create table  [ok]  :: <no output>
+PASS  create metered chain (policy drop)  [ok]  :: <no output>
+PASS  named counter object  [ok]  :: <no output>
+PASS  named quota object  [ok]  :: <no output>
+PASS  rule: counter + quota + drop  [ok]  :: <no output>
+
+--- B. THE C1 FACTS (the reason metered chains must be default-deny) ---
+PASS  quota+accept rule builds (accept policy)  [ok]  :: <no output>
+FAIL  quota then accept in same chain  [want ok, got err]  :: Error: No such file or directory; did you mean chain 'INPUT' in table ip 'filter'?
+add rule ip __wp2_t a ip saddr 10.0.0.2 quota name __wp2_q_a accept
+                                                   ^^^^^^^^^
+PASS  'over 0 bytes' is accepted as a limit  [ok]  :: <no output>
+  NOTE: `over 0 bytes` is UNLIMITED, not a block. Read back below shows no 'over' line.
+
+--- C. the EOPNOTSUPP blockers (why per-client objects are pre-provisioned) ---
+PASS  declare counter MAP  [ok]  :: <no output>
+PASS  declare counter map with flags dynamic  [err]  :: Error: Could not process rule: Operation not supported
+add map ip __wp2_t __wp2_m_dyn { type ipv4_addr : counter; size 64; flags dynamic; }
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PASS  UPDATE into a declared counter map  [err]  :: Error: Could not process rule: Operation not supported
+add rule ip __wp2_t a update @__wp2_m { ip saddr }
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+PASS  declare quota MAP  [ok]  :: <no output>
+PASS  add ELEMENT to a counter map  [err]  :: Error: Could not process rule: Invalid argument
+add element ip __wp2_t __wp2_m { 10.0.0.9 }
+                                 ^^^^^^^^
+
+--- D. the primitives the control plane DEPENDS ON ---
+FAIL  atomic quota limit swap (one nft -f)  [want ok, got err]  :: /tmp/wp2_swap.nft:1:25-31: Error: Could not process rule: Device or resource busy
+delete quota ip __wp2_t __wp2_q
+                        ^^^^^^^
+  read-back after swap:
+    table ip __wp2_t {
+    	quota __wp2_q {
+    		over 1000000 bytes
+    	}
+    }
+PASS  reset quota  [ok]  :: table ip __wp2_t {
+	quota __wp2_q {
+		over 1000000 bytes
+	}
+}
+PASS  reset counter  [ok]  :: table ip __wp2_t {
+	counter c1 {
+		packets 0 bytes 0
+	}
+}
+FAIL  replace rule by handle  :: could not obtain a rule handle
+
+--- E. read-back shapes the daemon depends on ---
+PASS  list table as JSON (nft -j)  [ok]  :: {"nftables": [{"metainfo": {"version": "1.1.3", "release_name": "Commodore Bullmoose #4", "json_schema_version": 1}}, {"table": {"family": "ip", "name": "__wp2_t", "handle": 36}}, {"chain": {"family": "ip", "table": "__wp2_t", "name": "u", "handle": 1, "type": "filter", "hook": "input", "prio": 10, "policy": "drop"}}, {"chain": {"family": "ip", "table": "__wp2_t", "name": "a", "handle": 5, "type": "filter", "hook": "forward", "prio": 10, "policy": "accept"}}, {"counter": {"family": "ip", "name": "c1", "table": "__wp2_t", "handle": 2, "packets": 0, "bytes": 0}}, {"quota": {"family": "ip", "name": "__wp2_q", "table": "__wp2_t", "handle": 3, "bytes": 1000000, "used": 0, "inv": true}}, {"quota": {"family": "ip", "name": "__wp2_q_zero", "table": "__wp2_t", "handle": 7, "bytes": 0, "used": 0, "inv": true}}, {"map": {"family": "ip", "name": "__wp2_m", "table": "__wp2_t", "type": "ipv4_addr", "handle": 8, "map": "counter", "size": 64}}, {"map": {"family": "ip", "name": "__wp2_qm", "table": "__wp2_t", "type": "ipv4_addr", "handle": 10, "map": "quota", "size": 64}}, {"rule": {"family": "ip", "table": "__wp2_t", "chain": "u", "handle": 4, "expr": [{"match": {"op": "==", "left": {"payload": {"protocol": "ip", "field": "saddr"}}, "right": "10.0.0.1"}}, {"counter": "c1"}, {"quota": "__wp2_q"}, {"drop": null}]}}]}
+  JSON is the cheapest per-tick read: one netlink round trip for the whole table.
+  object shapes observed:
+
+--- F. WHICH KERNEL FEATURES ACTUALLY DIFFER FROM THE LAB ---
+lab kernel was 7.0.0-38-generic / nft 1.0.9; this is 6.12.111+deb13-amd64 / v1.1.3
+  nf_conntrack_acct = 0
+
+--- cleanup: our __wp2_* tables removed ---
+tables now present on the host (production tables must ALL still be here):
+    table ip filter
+    table ip6 filter
+    table inet f2b-table
+    table inet fips-exit
+    table ip nat
+    table ip6 nat
+    table ip raw
+    table inet fips
+    table ip tgmeter
+
+RAW RECORD: /home/c08r4d0r/reports/mptcp-loop/wp2-primitive-matrix.txt

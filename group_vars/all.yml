@@ -56,3 +56,65 @@ nat_interface: ""
 
 # --- Data Directory ---
 mptcp_data_dir: "/opt/tollgate/mptcp"
+
+# --- TollGate Meter (roles/meter, WP1) ---
+#
+# The metering ceiling for a paid bonding service. WP1 installs the SHAPE only: our own
+# nftables table, default-deny, with the never-block-payment allow-list and the empty
+# per-client object area. No budget is installed and nothing is billed by this role.
+#
+# Every value here is a variable on purpose. The failure this guards against is silent: a
+# metered chain in `policy accept` delivers over-quota traffic and looks healthy (measured:
+# 81/100 over-quota packets passed), and a rule keyed on an egress interface meters the
+# server's INTERNET side so the customer pays for the server's own retransmissions.
+meter_enabled: true
+
+# Own table only. NEVER flush or replace the host's ruleset: this box may host other services,
+# and /etc/nftables.conf is shared. Address our table by name and leave everything else alone.
+meter_table: "tgmeter"
+meter_family: "ip"          # 'ip' keys a v4 client address directly; 'inet' needs a nfproto guard per rule
+meter_uplink_chain: "uplink"
+meter_downlink_chain: "downlink"
+
+# Must be 'drop'. Asserted in roles/meter/tasks/main.yml — a metered chain that is not
+# default-deny is a free tunnel, so this is not offered as a choice.
+meter_default_verdict: "drop"
+
+# The proxied data path (the metered leg) and the payment surface (never gated).
+meter_proxy_port: 65101
+meter_payment_port: 2121
+
+# The client population, used for the never-block allow-list. Tighten to the real client
+# range before enabling enforcement.
+meter_client_cidr: "0.0.0.0/0"
+
+# Object name prefixes. One named counter per direction plus one named quota per client
+# (WP4). Dynamic maps are NOT used: `update @map { ip saddr }` returns EOPNOTSUPP on stock
+# nftables, so every client's objects must be pre-provisioned — and if that silently no-ops,
+# the meter bills nobody and reports nothing.
+meter_counter_prefix: "c"
+meter_quota_prefix: "q"
+
+# Per-client objects, provisioned by the control plane (WP4). Empty in WP1, which is why the
+# ceiling is default-deny: an unprovisioned client is quarantined loudly rather than served free.
+meter_client_objects: []
+
+# Where the rendered table, the usage journal and the client list live. Declared and
+# configurable, never an incidental path.
+meter_state_dir: "{{ mptcp_data_dir }}/meter"
+
+# Resolvers that stay reachable while a client is gated (DNS breaks first, least visibly).
+meter_resolvers: ["9.9.9.9", "149.112.112.112"]
+
+# Policy inputs, NOT kernel constants.
+meter_tick_seconds: 1
+meter_bytes_per_sat: 1048576
+meter_grace_bytes: 262144
+
+# Expected accept-rule counts per chain, for the duplicate guard. Derived from the shape:
+# 2 resolver rules (udp+tcp on port 53, present only when meter_resolvers is non-empty)
+# + 2 payment rules (tcp+udp on meter_payment_port, always present).
+# The guard exists because `nft -f` APPENDS to an existing table, so a repeated apply multiplies
+# every rule while the playbook reports changed=0 and presence-based guards still pass.
+meter_expected_uplink_accepts: 4
+meter_expected_downlink_accepts: 4
